@@ -1,81 +1,139 @@
 import os
+import sys
+import json
 import argparse
 from urllib.parse import urlparse, urlunparse
+from atlassian.errors import ApiError
 
 import requests
+import logging
 import bs4
 from markdownify import MarkdownConverter
 from atlassian import Confluence
+
+from typing import TypedDict, List, Set
 
 
 ATTACHMENT_FOLDER_NAME = "attachments"
 DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024   # 4MB, since we're single threaded this is safe to raise much higher
 
 
+class PageDescription(TypedDict):
+    sanitized_filename: str
+    sanitized_parents: List[str]
+    document_name: str
+    page_location: List[str]
+    page_filename: str
+    page_output_dir: str
+
+
 class ExportException(Exception):
     pass
 
+def suppress_confluence_info_logs():
+    # Confluence module likes to log url endpoint for every request.
+    # dumb workaround to suppress INFO logs
+    confluence_logger = logging.getLogger('atlassian.confluence')
+    confluence_logger.setLevel(logging.WARNING)
+
 
 class Exporter:
-    def __init__(self, url, username, token, out_dir, space, no_attach):
+    def __init__(self, url, username, token, out_dir, space: str, no_attach):
         self.__out_dir = out_dir
         self.__parsed_url = urlparse(url)
         self.__username = username
         self.__token = token
+        suppress_confluence_info_logs()
         self.__confluence = Confluence(url=urlunparse(self.__parsed_url),
                                        username=self.__username,
                                        password=self.__token)
-        self.__seen = set()
+        self.__seen: Set[int] = set()
         self.__no_attach = no_attach
-        self.__space = space
+        self.__target_space_key = space if space.startswith("~") else "~" + space
 
-    def __sanitize_filename(self, document_name_raw):
+    def __should_skip_download(self, page_id, last_modified):
+        """Check if the page should be skipped based on the index."""
+        index = self.__load_index()
+
+        # If page is not in the index or has a newer last_modified date, don't skip
+        if page_id not in index or index[page_id] < last_modified:
+            return False
+
+        return True
+
+    def __load_index(self):
+        """Load the index file or return an empty dict if it doesn't exist."""
+        if os.path.exists('index.json'):
+            with open('index.json', 'r') as f:
+                return json.load(f)
+        return {}
+
+    def __update_index(self, page_id, last_modified):
+        """Update the index file with the new metadata."""
+        index = self.__load_index()
+        index[page_id] = last_modified
+
+        with open('index.json', 'w') as f:
+            json.dump(index, f)
+
+    def __sanitize_filename(self, document_name_raw) -> str:
         document_name = document_name_raw
         for invalid in ["..", "/"]:
             if invalid in document_name:
-                print("Dangerous page title: \"{}\", \"{}\" found, replacing it with \"_\"".format(
+                logging.warning("Dangerous page title: \"{}\", \"{}\" found, replacing it with \"_\"".format(
                     document_name,
                     invalid))
                 document_name = document_name.replace(invalid, "_")
         return document_name
 
-    def __dump_page(self, src_id, parents):
-        if src_id in self.__seen:
-            # this could theoretically happen if Page IDs are not unique or there is a circle
-            raise ExportException("Duplicate Page ID Found!")
+    def __get_descr(self, page, parents, is_leaf_node) -> PageDescription:
+        """
+        Get a description of the given page with various properties.
 
-        page = self.__confluence.get_page_by_id(src_id, expand="body.storage")
-        page_title = page["title"]
-        page_id = page["id"]
-    
-        # see if there are any children
-        child_ids = self.__confluence.get_child_id_list(page_id)
-    
-        content = page["body"]["storage"]["value"]
+        :param page: The page for which the description is needed.
+        :return: A dictionary containing sanitized_filename, document_name, 
+                 page_location, page_filename, and page_output_dir.
+        """
 
         # save all files as .html for now, we will convert them later
         extension = ".html"
-        if len(child_ids) > 0:
-            document_name = "index" + extension
+        if is_leaf_node:
+            document_name = page["title"] + extension
         else:
-            document_name = page_title + extension
+            document_name = "index" + extension
 
         # make some rudimentary checks, to prevent trivial errors
         sanitized_filename = self.__sanitize_filename(document_name)
-        sanitized_parents = list(map(self.__sanitize_filename, parents))
+        sanitized_parents: List[str] = list(map(self.__sanitize_filename, parents))
 
-        page_location = sanitized_parents + [sanitized_filename]
+        page_location: List[str] = sanitized_parents + [sanitized_filename]
         page_filename = os.path.join(self.__out_dir, *page_location)
 
         page_output_dir = os.path.dirname(page_filename)
-        os.makedirs(page_output_dir, exist_ok=True)
-        print("Saving to {}".format(" / ".join(page_location)))
-        with open(page_filename, "w", encoding="utf-8") as f:
+
+        return {
+            'sanitized_filename': sanitized_filename,
+            'sanitized_parents': sanitized_parents,
+            'document_name': document_name,
+            'page_location': page_location,
+            'page_filename': page_filename,
+            'page_output_dir': page_output_dir
+        }
+
+
+    def __download_page(self, page, parents, is_leaf_node, when_modified):
+        content = page["body"]["storage"]["value"]
+
+        descr = self.__get_descr(page, parents, is_leaf_node)
+        os.makedirs(descr['page_output_dir'], exist_ok=True)
+        logging.info("Saving to {}".format(" / ".join(descr['page_location'])))
+
+        with open(descr['page_filename'], "w", encoding="utf-8") as f:
             f.write(content)
 
         # fetch attachments unless disabled
         if not self.__no_attach:
-            ret = self.__confluence.get_attachments_from_content(page_id, start=0, limit=500, expand=None,
+            ret = self.__confluence.get_attachments_from_content(page["id"], start=0, limit=500, expand=None,
                                                                  filename=None, media_type=None)
             for i in ret["results"]:
                 att_title = i["title"]
@@ -85,17 +143,17 @@ class Exporter:
                     (self.__parsed_url[0], self.__parsed_url[1], "/wiki/" + download.lstrip("/"), None, None, None)
                 )
                 att_sanitized_name = self.__sanitize_filename(att_title)
-                att_filename = os.path.join(page_output_dir, ATTACHMENT_FOLDER_NAME, att_sanitized_name)
+                att_filename = os.path.join(descr['page_output_dir'], ATTACHMENT_FOLDER_NAME, att_sanitized_name)
 
                 att_dirname = os.path.dirname(att_filename)
                 os.makedirs(att_dirname, exist_ok=True)
 
-                print("Saving attachment {} to {}".format(att_title, page_location))
+                logging.debug("Saving attachment {} to {}".format(att_title, descr['page_location']))
 
                 r = requests.get(att_url, auth=(self.__username, self.__token), stream=True)
                 if 400 <= r.status_code:
                     if r.status_code == 404:
-                        print("Attachment {} not found (404)!".format(att_url))
+                        logging.warning("Attachment {} not found (404)!".format(att_url))
                         continue
 
                     # this is a real error, raise it
@@ -105,32 +163,85 @@ class Exporter:
                     for buf in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                         f.write(buf)
 
-        self.__seen.add(page_id)
+        self.__seen.add(page["id"])
+        self.__update_index(page['id'], when_modified)
+
+
+    def __dump_page(self, src_id: int, parents) -> None:
+        if src_id in self.__seen:
+            # this could theoretically happen if Page IDs are not unique or there is a circle
+            raise ExportException("Duplicate Page ID Found!")
+
+        page = self.__confluence.get_page_by_id(src_id, expand="body.storage")
+        page_title = page["title"]
+        page_id = page["id"]
+
+        properties = self.__confluence.get_page_properties(page_id)
+        when_modified = properties["results"][0]["version"]['when']
+    
+        # see if there are any children
+        child_ids = self.__confluence.get_child_id_list(page_id)
+        is_leaf_node = len(child_ids) == 0
+
+        page_descr = self.__get_descr(page, parents, is_leaf_node)
+
+        if self.__should_skip_download(page_id, when_modified) == False:
+            # TODO - test if this modification time is recursive.
+            # Probably not, so we likely still need to recurse through everything
+            # Starting with this, can modify as needed
+            self.__download_page(page,  parents, is_leaf_node, when_modified)
+
     
         # recurse to process child nodes
         for child_id in child_ids:
-            self.__dump_page(child_id, parents=sanitized_parents + [page_title])
+            self.__dump_page(child_id, parents=page_descr['sanitized_parents'] + [page_title])
 
-    def __dump_space(self, space):
-        space_key = space["key"]
-        print("Processing space", space_key)
-        if space.get("homepage") is None:
-            print("Skipping space: {}, no homepage found!".format(space_key))
-            print("In order for this tool to work there has to be a root page!")
-            raise ExportException("No homepage found")
+    def dump_target_space(self) -> None: 
+        logging.info(f"Looking for target space {self.__target_space_key}")
+        try:
+            ret = self.__confluence.get_space(self.__target_space_key)
+
+        except ApiError as e:
+            err_msg: str = e.reason.args[0]
+            confluence_not_found_err_class = "com.atlassian.confluence.api.service.exceptions.NotFoundException"
+            not_found = err_msg.startswith(confluence_not_found_err_class)
+
+            if not_found:
+                msg = err_msg[len(confluence_not_found_err_class)]
+                logging.error(msg)
+                return
+            else:
+                logging.error("Unknown error encountered while retrieving the target space: {e}")
+                return
+
+        if ret.get('homepage') is None:
+            logging.error("Specified space was found, but no 'homepage' was marked.")
+            return
+
+        self.__dump_page(ret['homepage']['id'], parents=[ret['key']])
+
+
+    def dump(self) -> None:
+        if self.__target_space_key:
+            self.dump_target_space()
         else:
-            # homepage found, recurse from there
-            homepage_id = space["homepage"]["id"]
-            self.__dump_page(homepage_id, parents=[space_key])
+            self.dump_all_spaces()
 
-    
-    def dump(self):
+    def dump_all_spaces(self) -> None:
         ret = self.__confluence.get_all_spaces(start=0, limit=500, expand='description.plain,homepage')
         if ret['size'] == 0:
-            print("No spaces found in confluence. Please check credentials")
+            logging.error("No spaces found in confluence. Please check credentials")
         for space in ret["results"]:
-            if self.__space is None or space["key"] == self.__space:
-                self.__dump_space(space)
+            space_key = space["key"]
+            logging.debug("Processing space", space_key)
+            if space.get("homepage") is None:
+                logging.warning("Skipping space: {}, no homepage found!".format(space_key))
+                logging.warning("In order for this tool to work there has to be a root page!")
+                raise ExportException(f"No homepage found for space {space_key}")
+            else:
+                # homepage found, recurse from there
+                homepage_id = space["homepage"]["id"]
+                self.__dump_page(homepage_id, parents=[space_key])
 
 
 class Converter:
@@ -173,7 +284,7 @@ class Converter:
             if not path.endswith(".html"):
                 continue
 
-            print("Converting {}".format(path))
+            logging.info("Converting {}".format(path))
             with open(path, "r", encoding="utf-8") as f:
                 data = f.read()
 
@@ -187,12 +298,19 @@ class Converter:
 
 
 if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,  # Set default logging level to INFO
+        stream=sys.stdout,   # Set default output to stdout
+        format='%(asctime)s [%(filename)s:%(lineno)d] %(levelname)s: %(message)s',  # Include ISO 8601 timestamp
+        datefmt='%Y-%m-%dT%H:%M:%S'  # ISO 8601 date format
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("url", type=str, help="The url to the confluence instance")
     parser.add_argument("username", type=str, help="The username")
     parser.add_argument("token", type=str, help="The access token to Confluence")
     parser.add_argument("out_dir", type=str, help="The directory to output the files to")
-    parser.add_argument("--space", type=str, required=False, default=None, help="Spaces to export")
+    parser.add_argument("--personal-space-key", type=str, required=False, default=None, help="Spaces to export")
     parser.add_argument("--skip-attachments", action="store_true", dest="no_attach", required=False,
                         default=False, help="Skip fetching attachments")
     parser.add_argument("--no-fetch", action="store_true", dest="no_fetch", required=False,
@@ -201,7 +319,7 @@ if __name__ == "__main__":
     
     if not args.no_fetch:
         dumper = Exporter(url=args.url, username=args.username, token=args.token, out_dir=args.out_dir,
-                          space=args.space, no_attach=args.no_attach)
+                          space=args.personal_space_key, no_attach=args.no_attach)
         dumper.dump()
     
     converter = Converter(out_dir=args.out_dir)
