@@ -1,17 +1,17 @@
-import os
-import sys
-import json
-import argparse
-from urllib.parse import urlparse, urlunparse
-from atlassian.errors import ApiError
-
-import requests
-import logging
-import bs4
-from markdownify import MarkdownConverter
 from atlassian import Confluence
-
+from atlassian.errors import ApiError
+from dotenv import load_dotenv
+from markdownify import MarkdownConverter
 from typing import TypedDict, List, Set
+from urllib.parse import urlparse, urlunparse
+
+import bs4
+import configargparse
+import json
+import logging
+import os
+import requests
+import sys
 
 
 ATTACHMENT_FOLDER_NAME = "attachments"
@@ -53,28 +53,10 @@ class Exporter:
 
     def __should_skip_download(self, page_id, last_modified):
         """Check if the page should be skipped based on the index."""
-        index = self.__load_index()
 
-        # If page is not in the index or has a newer last_modified date, don't skip
-        if page_id not in index or index[page_id] < last_modified:
-            return False
+        # This functionality is not currently implemented
 
         return True
-
-    def __load_index(self):
-        """Load the index file or return an empty dict if it doesn't exist."""
-        if os.path.exists('index.json'):
-            with open('index.json', 'r') as f:
-                return json.load(f)
-        return {}
-
-    def __update_index(self, page_id, last_modified):
-        """Update the index file with the new metadata."""
-        index = self.__load_index()
-        index[page_id] = last_modified
-
-        with open('index.json', 'w') as f:
-            json.dump(index, f)
 
     def __sanitize_filename(self, document_name_raw) -> str:
         document_name = document_name_raw
@@ -186,9 +168,6 @@ class Exporter:
         page_descr = self.__get_descr(page, parents, is_leaf_node)
 
         if self.__should_skip_download(page_id, when_modified) == False:
-            # TODO - test if this modification time is recursive.
-            # Probably not, so we likely still need to recurse through everything
-            # Starting with this, can modify as needed
             self.__download_page(page,  parents, is_leaf_node, when_modified)
 
     
@@ -197,7 +176,7 @@ class Exporter:
             self.__dump_page(child_id, parents=page_descr['sanitized_parents'] + [page_title])
 
     def dump_target_space(self) -> None: 
-        logging.info(f"Looking for target space {self.__target_space_key}")
+        logging.debug(f"Looking for target space {self.__target_space_key}")
         try:
             ret = self.__confluence.get_space(self.__target_space_key)
 
@@ -218,6 +197,7 @@ class Exporter:
             logging.error("Specified space was found, but no 'homepage' was marked.")
             return
 
+        logging.info(f"Found target space {self.__target_space_key}, downloading it...")
         self.__dump_page(ret['homepage']['id'], parents=[ret['key']])
 
 
@@ -296,8 +276,21 @@ class Converter:
             with open(newname + ".md", "w", encoding="utf-8") as f:
                 f.write(md)
 
-
 if __name__ == "__main__":
+    load_dotenv()
+
+    parser = configargparse.ArgumentParser()
+    parser.add_argument("--url", type=str, required=True, help="The url to the confluence instance", env_var="PYCNFL_URL")
+    parser.add_argument("--username", type=str, required=True, help="The username", env_var="PYCNFL_USERNAME")
+    parser.add_argument("--token", type=str, required=True, help="The access token to Confluence", env_var="PYCNFL_TOKEN")
+    parser.add_argument("--out_dir", type=str, required=True, help="The directory to output the files to", env_var="PYCNFL_OUT_DIR")
+    parser.add_argument("--personal-space-key", type=str, required=False, default=None, help="Spaces to export", env_var="PYCNFL_PERSONAL_SPACE_KEY")
+    parser.add_argument("--skip-attachments", action="store_true", dest="no_attach", required=False,
+                        default=False, help="Skip fetching attachments", env_var="PYNCFL_SKIP_ATTACHMENTS")
+    parser.add_argument("--no-fetch", action="store_true", dest="no_fetch", required=False,
+                        default=False, help="This option only runs the markdown conversion", env_var="PYNCFL_NO_FETCH")
+    args = parser.parse_args()
+
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,  # Set default logging level to INFO
@@ -305,17 +298,6 @@ if __name__ == "__main__":
         format='%(asctime)s [%(filename)s:%(lineno)d] %(levelname)s: %(message)s',  # Include ISO 8601 timestamp
         datefmt='%Y-%m-%dT%H:%M:%S'  # ISO 8601 date format
     )
-    parser = argparse.ArgumentParser()
-    parser.add_argument("url", type=str, help="The url to the confluence instance")
-    parser.add_argument("username", type=str, help="The username")
-    parser.add_argument("token", type=str, help="The access token to Confluence")
-    parser.add_argument("out_dir", type=str, help="The directory to output the files to")
-    parser.add_argument("--personal-space-key", type=str, required=False, default=None, help="Spaces to export")
-    parser.add_argument("--skip-attachments", action="store_true", dest="no_attach", required=False,
-                        default=False, help="Skip fetching attachments")
-    parser.add_argument("--no-fetch", action="store_true", dest="no_fetch", required=False,
-                        default=False, help="This option only runs the markdown conversion")
-    args = parser.parse_args()
     
     if not args.no_fetch:
         dumper = Exporter(url=args.url, username=args.username, token=args.token, out_dir=args.out_dir,
